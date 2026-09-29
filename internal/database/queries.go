@@ -462,21 +462,6 @@ func (db *DB) GetCachedArtifactCount() (int64, error) {
 // elsewhere is left alone, so a clear never orphans the object that fetch
 // committed.
 func (db *DB) ClearArtifactCache(versionPURL, filename, storagePath string) (bool, error) {
-	return db.clearArtifactCache(versionPURL, filename, storagePath)
-}
-
-// DiscardArtifact clears the record as ClearArtifactCache does and queues
-// storagePath for deletion, for callers that must not delete an object another
-// request may be reading.
-func (db *DB) DiscardArtifact(versionPURL, filename, storagePath string) error {
-	cleared, err := db.clearArtifactCache(versionPURL, filename, storagePath)
-	if err != nil || !cleared {
-		return err
-	}
-	return db.QueuePendingDelete(storagePath)
-}
-
-func (db *DB) clearArtifactCache(versionPURL, filename, storagePath string) (bool, error) {
 	query := db.Rebind(`
 		UPDATE artifacts
 		SET storage_path = NULL, content_hash = NULL, size = NULL,
@@ -491,8 +476,20 @@ func (db *DB) clearArtifactCache(versionPURL, filename, storagePath string) (boo
 	return n > 0, err
 }
 
+// DiscardArtifact clears the record as ClearArtifactCache does and queues
+// storagePath for deletion, for callers that must not delete an object another
+// request may be reading.
+func (db *DB) DiscardArtifact(versionPURL, filename, storagePath string) error {
+	cleared, err := db.ClearArtifactCache(versionPURL, filename, storagePath)
+	if err != nil || !cleared {
+		return err
+	}
+	return db.QueuePendingDelete(storagePath)
+}
+
 // QueuePendingDelete queues a storage path no record points at any more.
-// Queueing a path again restarts its grace period.
+// Queueing a path again, as reclaim does after a failed delete, restarts its
+// grace period and moves it behind the rest.
 func (db *DB) QueuePendingDelete(path string) error {
 	query := db.Rebind(`
 		INSERT INTO pending_deletes (path, queued_at) VALUES (?, ?)

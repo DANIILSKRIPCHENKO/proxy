@@ -36,7 +36,8 @@ func (s *Server) startReclaimLoop(ctx context.Context) {
 }
 
 // reclaimStorage deletes up to one batch of objects queued before cutoff. A
-// delete that fails stays queued for the next pass to retry.
+// delete that fails is queued again, behind the rest, so objects the backend
+// keeps refusing cannot fill every batch.
 func reclaimStorage(ctx context.Context, db *database.DB, store storage.Storage, logger *slog.Logger, cutoff time.Time) {
 	paths, err := db.GetDuePendingDeletes(cutoff, reclaimBatch)
 	if err != nil {
@@ -49,7 +50,13 @@ func reclaimStorage(ctx context.Context, db *database.DB, store storage.Storage,
 			return
 		}
 		if err := store.Delete(ctx, path); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			logger.Warn("reclaim: failed to delete object, will retry", "path", path, "error", err)
+			if err := db.QueuePendingDelete(path); err != nil {
+				logger.Warn("reclaim: failed to requeue object", "path", path, "error", err)
+			}
 			continue
 		}
 		if err := db.RemovePendingDelete(path); err != nil {

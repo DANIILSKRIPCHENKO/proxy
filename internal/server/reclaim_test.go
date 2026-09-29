@@ -61,20 +61,31 @@ func TestReclaimStorageWaitsForGracePeriod(t *testing.T) {
 	}
 }
 
-func TestReclaimStorageKeepsFailedDeletesQueued(t *testing.T) {
+// TestReclaimStorageRequeuesFailedDeletes checks a refused delete goes behind
+// the rest of the queue, so objects the backend keeps refusing cannot hold every
+// slot in a batch.
+func TestReclaimStorageRequeuesFailedDeletes(t *testing.T) {
 	db, store := setupEvictionTest(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const path = "npm/old/1.0.0/a/old-1.0.0.tgz"
 	storeQueued(t, db, store, path)
+	queued := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := db.Exec(db.Rebind(`UPDATE pending_deletes SET queued_at = ? WHERE path = ?`), queued, path); err != nil {
+		t.Fatalf("backdating queue entry: %v", err)
+	}
+	cutoff := time.Now().Add(-time.Hour)
 
 	undeletable := &undeletableStorage{Storage: store}
-	reclaimStorage(context.Background(), db, undeletable, logger, time.Now().Add(time.Hour))
+	reclaimStorage(context.Background(), db, undeletable, logger, cutoff)
 
 	if got := undeletable.deletes.Load(); got != 1 {
 		t.Errorf("delete attempts = %d, want 1", got)
 	}
 	if got := queuedPaths(t, db); !slices.Equal(got, []string{path}) {
 		t.Errorf("queue = %v, want the failed path kept for retry", got)
+	}
+	if due, err := db.GetDuePendingDeletes(cutoff, 100); err != nil || len(due) != 0 {
+		t.Errorf("due after a failed delete = %v (err %v), want it moved behind the cutoff", due, err)
 	}
 }
 

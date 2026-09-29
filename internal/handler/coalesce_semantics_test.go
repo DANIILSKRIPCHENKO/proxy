@@ -402,7 +402,7 @@ func TestCoalesce_KeyIsReleasedAfterFetch(t *testing.T) {
 
 	// A fresh miss for the same key must start a new fetch, not rejoin the old
 	// entry. Clearing the cache record forces the miss path again.
-	if err := proxy.ClearCachedArtifact(context.Background(), "npm", "pkg", "1.0.0", "pkg-1.0.0.tgz"); err != nil {
+	if err := proxy.ClearCachedArtifact("npm", "pkg", "1.0.0", "pkg-1.0.0.tgz"); err != nil {
 		t.Fatalf("clear cached artifact: %v", err)
 	}
 	res, err := proxy.GetOrFetchArtifactFromURL(context.Background(),

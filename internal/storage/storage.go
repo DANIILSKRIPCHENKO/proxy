@@ -75,7 +75,8 @@ type Storage interface {
 }
 
 // ArtifactPath builds the storage path artifacts were cached under before each
-// fetch got its own; records from then still point at such paths.
+// fetch got its own; records from then still point at such paths. Only tests
+// call it, to build such records.
 // Format: {ecosystem}/{namespace}/{name}/{version}/{filename}
 // For packages without namespace: {ecosystem}/{name}/{version}/{filename}
 func ArtifactPath(ecosystem, namespace, name, version, filename string) string {

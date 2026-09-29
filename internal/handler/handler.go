@@ -269,7 +269,7 @@ func (p *Proxy) GetCachedArtifact(ctx context.Context, ecosystem, name, version,
 
 // ClearCachedArtifact clears an artifact cache record after an external
 // integrity check fails, and queues its stored bytes for deletion.
-func (p *Proxy) ClearCachedArtifact(_ context.Context, ecosystem, name, version, filename string) error {
+func (p *Proxy) ClearCachedArtifact(ecosystem, name, version, filename string) error {
 	if p.DB == nil || p.Storage == nil {
 		return nil
 	}
