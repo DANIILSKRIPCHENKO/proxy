@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,6 +17,21 @@ const (
 	npmUpstream      = "https://registry.npmjs.org"
 	npmAcceptDefault = "application/vnd.npm.install-v1+json;q=1.0, application/json;q=0.8"
 	scopedParts      = 2 // scope + name in scoped packages
+
+	// npmSecurityPrefix is the base path npm, pnpm and Yarn use for the audit
+	// and bulk advisory endpoints: /-/npm/v1/security/audits,
+	// /-/npm/v1/security/audits/quick and /-/npm/v1/security/advisories/bulk.
+	npmSecurityPrefix = "/-/npm/v1/security/"
+
+	// npmSecurityMaxBody caps the audit payload read from the client. The body
+	// is a name-to-version map of the whole dependency tree, so even a large
+	// monorepo lockfile stays well under this.
+	//
+	// The body is buffered rather than streamed upstream so an oversized
+	// payload can be answered with a 413 before the upstream request starts;
+	// streaming would surface the cap as a write failure mid-request. That
+	// bounds memory at this cap per in-flight audit request.
+	npmSecurityMaxBody = 16 << 20
 )
 
 // NPMHandler handles npm registry protocol requests.
@@ -41,6 +58,13 @@ func NewNPMHandler(proxy *Proxy, proxyURL, upstreamURL string) *NPMHandler {
 // Mount this at /npm on your router.
 func (h *NPMHandler) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Audit endpoints are POSTs and share the /-/ prefix with tarball
+		// paths, so they have to be routed before the GET-only gate below.
+		if strings.HasPrefix(r.URL.Path, npmSecurityPrefix) {
+			h.handleSecurity(w, r)
+			return
+		}
+
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -57,6 +81,110 @@ func (h *NPMHandler) Routes() http.Handler {
 		// Otherwise it's a metadata request
 		h.handlePackageMetadata(w, r)
 	})
+}
+
+// npmSecurityForwardHeaders are the request headers the audit passthrough
+// carries upstream. The body is opaque to the proxy and clients may send it
+// gzipped, so the headers describing how to read it have to travel with it.
+var npmSecurityForwardHeaders = []string{ //nolint:gochecknoglobals // fixed header list shared across audit requests
+	headerContentType,
+	headerContentEncoding,
+	"Accept",
+	headerAcceptEncoding,
+}
+
+// handleSecurity relays the npm security endpoints (`npm audit`, `pnpm audit`,
+// `yarn npm audit`) to upstream verbatim.
+//
+// There is nothing for the proxy to do to these beyond passing them along: the
+// request body is the dependency tree being audited, so no two requests share a
+// cache key, and the response is an advisory report that carries no tarball
+// URLs to rewrite. Without this, the handler answered the POST with a 405 and a
+// plain-text body, which clients report as a malformed audit response
+// (ERR_PNPM_AUDIT_BAD_RESPONSE).
+//
+// Note that advisories come from upstream's database, not from the proxy's own
+// vulnerability data, and cooldown-filtered versions are not excluded from the
+// report.
+func (h *NPMHandler) handleSecurity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if containsPathTraversal(r.URL.Path) {
+		JSONError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, npmSecurityMaxBody))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			h.proxy.Logger.Warn("npm audit request over size cap",
+				"path", r.URL.Path, "limit", npmSecurityMaxBody)
+			JSONError(w, http.StatusRequestEntityTooLarge, "audit request too large")
+			return
+		}
+		// A client that aborts mid-upload lands here. Reporting it as 413
+		// would send operators looking for a size limit that was never hit.
+		h.proxy.Logger.Warn("npm audit request body unreadable", "path", r.URL.Path, "error", err)
+		JSONError(w, http.StatusBadRequest, "could not read audit request")
+		return
+	}
+
+	// EscapedPath keeps a percent-encoded "?" or "#" in the request path
+	// encoded. The decoded r.URL.Path would let either character turn the rest
+	// of the path into a query or fragment on the upstream request.
+	upstreamURL := h.upstreamURL + r.URL.EscapedPath()
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	h.proxy.Logger.Info("npm audit request", "path", r.URL.Path, "bytes", len(body))
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		JSONError(w, http.StatusInternalServerError, "failed to create request")
+		return
+	}
+
+	for _, header := range npmSecurityForwardHeaders {
+		if v := r.Header.Get(header); v != "" {
+			req.Header.Set(header, v)
+		}
+	}
+	if req.Header.Get(headerContentType) == "" {
+		req.Header.Set(headerContentType, contentTypeJSON)
+	}
+	req.ContentLength = int64(len(body))
+	h.proxy.applyUpstreamAuth(req)
+
+	resp, err := h.proxy.HTTPClient.Do(req)
+	if err != nil {
+		h.proxy.Logger.Error("npm audit request failed", "path", r.URL.Path, "error", err)
+		JSONError(w, http.StatusBadGateway, "failed to reach upstream registry")
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Content-Length is deliberately not copied. If the upstream connection
+	// breaks mid-report, letting Go pick the framing makes that a transport
+	// error the client can detect, rather than a 200 with a short body, which
+	// is the malformed-audit symptom this passthrough exists to avoid.
+	for key, values := range resp.Header {
+		if http.CanonicalHeaderKey(key) == headerContentLength {
+			continue
+		}
+		for _, v := range values {
+			w.Header().Add(key, v)
+		}
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		h.proxy.Logger.Warn("npm audit response truncated", "path", r.URL.Path, "error", err)
+	}
 }
 
 // handlePackageMetadata proxies package metadata from upstream and rewrites tarball URLs.
