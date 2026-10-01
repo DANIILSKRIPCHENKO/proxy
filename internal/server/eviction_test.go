@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -326,10 +327,10 @@ func runEvictionWithDeadline(t *testing.T, ctx context.Context, db *database.DB,
 	}
 }
 
-// TestEvictLRU_EndsPassWhenNothingCanBeEvicted is the loop that would otherwise
-// never end. Records that fail to delete stay eligible, so the same batch comes
-// back forever while the recorded size never drops.
-func TestEvictLRU_EndsPassWhenNothingCanBeEvicted(t *testing.T) {
+// TestEvictLRU_QueuesObjectsStorageRefusesToDelete evicts against a backend
+// that refuses every delete. The records are cleared, so the pass makes
+// progress, and the objects wait in the queue for reclaim to retry.
+func TestEvictLRU_QueuesObjectsStorageRefusesToDelete(t *testing.T) {
 	db, store := setupEvictionTest(t)
 	ctx := context.Background()
 
@@ -340,17 +341,55 @@ func TestEvictLRU_EndsPassWhenNothingCanBeEvicted(t *testing.T) {
 	undeletable := &undeletableStorage{Storage: store}
 	runEvictionWithDeadline(t, ctx, db, undeletable, 100)
 
-	// One attempt per record, then the pass ends. Both records survive for the
-	// next pass to retry.
 	if got := undeletable.deletes.Load(); got != 2 {
-		t.Errorf("delete attempts = %d, want 2: one per record in the single batch", got)
+		t.Errorf("delete attempts = %d, want 2", got)
 	}
 	count, err := db.GetCachedArtifactCount()
 	if err != nil {
 		t.Fatalf("failed to get count: %v", err)
 	}
+	if count != 0 {
+		t.Errorf("cached artifacts = %d, want 0", count)
+	}
+	want := []string{
+		storage.ArtifactPath("npm", "", "new-pkg", "1.0.0", "new-pkg-1.0.0.tgz"),
+		storage.ArtifactPath("npm", "", "old-pkg", "1.0.0", "old-pkg-1.0.0.tgz"),
+	}
+	got := queuedPaths(t, db)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("queue = %v, want %v", got, want)
+	}
+}
+
+// TestEvictLRU_EndsPassWhenNothingCanBeCleared is the loop that would otherwise
+// never end. A record that fails to clear stays eligible, so the same batch
+// comes back forever while the recorded size never drops.
+func TestEvictLRU_EndsPassWhenNothingCanBeCleared(t *testing.T) {
+	db, store := setupEvictionTest(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	seedArtifact(t, ctx, db, store, "old-pkg", 500, now.Add(-2*time.Hour))
+	seedArtifact(t, ctx, db, store, "new-pkg", 500, now)
+	if _, err := db.Exec(`CREATE TRIGGER refuse_clear BEFORE UPDATE OF storage_path ON artifacts
+		BEGIN SELECT RAISE(FAIL, 'clear refused'); END`); err != nil {
+		t.Fatalf("creating trigger: %v", err)
+	}
+
+	runEvictionWithDeadline(t, ctx, db, store, 0)
+
+	count, err := db.GetCachedArtifactCount()
+	if err != nil {
+		t.Fatalf("failed to get count: %v", err)
+	}
 	if count != 2 {
-		t.Errorf("cached artifacts = %d, want 2: a failed delete must not clear the record", count)
+		t.Errorf("cached artifacts = %d, want 2", count)
+	}
+	for _, name := range []string{"old-pkg", "new-pkg"} {
+		if ok, _ := store.Exists(ctx, storage.ArtifactPath("npm", "", name, "1.0.0", name+"-1.0.0.tgz")); !ok {
+			t.Errorf("%s deleted although its record was not cleared", name)
+		}
 	}
 }
 
@@ -401,5 +440,50 @@ func clearRecordedSize(t *testing.T, db *database.DB, versionPURL, filename stri
 	query := db.Rebind(`UPDATE artifacts SET size = NULL WHERE version_purl = ? AND filename = ?`)
 	if _, err := db.Exec(query, versionPURL, filename); err != nil {
 		t.Fatalf("clearing recorded size: %v", err)
+	}
+}
+
+// TestEvictBatch_SkipsRecordThatMoved evicts from a row read before a newer
+// fetch moved the record. Neither object goes: the old one is queued, and a
+// request that read the record before it moved may still open it. Nothing is
+// counted as freed either, or the pass would end with the cache still over its
+// limit.
+func TestEvictBatch_SkipsRecordThatMoved(t *testing.T) {
+	db, store := setupEvictionTest(t)
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	seedArtifact(t, ctx, db, store, "moved", 1000, time.Now().Add(-time.Hour))
+
+	stale, err := db.GetLeastRecentlyUsedArtifacts(evictionBatch)
+	if err != nil || len(stale) != 1 {
+		t.Fatalf("reading LRU rows: %v, %v", stale, err)
+	}
+	newer := storage.FetchPath("npm", "moved", "1.0.0", storage.NewFetchID(), "moved-1.0.0.tgz")
+	if _, _, err := store.Store(ctx, newer, strings.NewReader("refetched")); err != nil {
+		t.Fatalf("storing refetch: %v", err)
+	}
+	moved := stale[0]
+	moved.StoragePath = sql.NullString{String: newer, Valid: true}
+	if err := db.UpsertArtifact(&moved); err != nil {
+		t.Fatalf("moving record: %v", err)
+	}
+
+	cleared, freed := evictBatch(ctx, db, store, logger, stale, 0, 1000)
+	if cleared != 0 || freed != 0 {
+		t.Errorf("cleared %d records freeing %d bytes, want nothing counted", cleared, freed)
+	}
+	record, err := db.GetArtifact(moved.VersionPURL, moved.Filename)
+	if err != nil || record == nil || record.StoragePath.String != newer {
+		t.Fatalf("record = %+v (err %v), want it kept at %q", record, err, newer)
+	}
+	if ok, _ := store.Exists(ctx, newer); !ok {
+		t.Error("the newer fetch's object was deleted")
+	}
+	old := stale[0].StoragePath.String
+	if ok, _ := store.Exists(ctx, old); !ok {
+		t.Error("the old object was deleted during its grace period")
+	}
+	if got := queuedPaths(t, db); !slices.Equal(got, []string{old}) {
+		t.Errorf("queue = %v, want the old path kept for reclaim", got)
 	}
 }

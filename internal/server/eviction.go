@@ -116,16 +116,25 @@ func evictBatch(ctx context.Context, db *database.DB, store storage.Storage, log
 			continue
 		}
 
-		if err := store.Delete(ctx, art.StoragePath.String); err != nil {
-			logger.Warn("eviction: failed to delete from storage",
-				"path", art.StoragePath.String, "error", err)
-			continue
-		}
+		path := art.StoragePath.String
 
-		if err := db.ClearArtifactCache(art.VersionPURL, art.Filename); err != nil {
+		// Clear before deleting: a record a newer fetch moved has left this
+		// path queued, and a request may still open it within the grace period.
+		recordCleared, err := db.ClearArtifactCache(art.VersionPURL, art.Filename, path)
+		if err != nil {
 			logger.Warn("eviction: failed to clear artifact record",
 				"version_purl", art.VersionPURL, "filename", art.Filename, "error", err)
 			continue
+		}
+		if !recordCleared {
+			continue
+		}
+
+		if err := store.Delete(ctx, path); err != nil {
+			logger.Warn("eviction: failed to delete from storage, queueing it", "path", path, "error", err)
+			if err := db.QueuePendingDelete(path); err != nil {
+				logger.Warn("eviction: failed to queue object for deletion", "path", path, "error", err)
+			}
 		}
 
 		if art.Size.Valid {
