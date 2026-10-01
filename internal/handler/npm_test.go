@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/git-pkgs/cooldown"
@@ -707,5 +711,351 @@ func TestNPMDownloadErrorResponsesAreJSON(t *testing.T) {
 				t.Errorf("response body %v missing \"error\" key", body)
 			}
 		})
+	}
+}
+
+// newNPMAuditUpstream returns a handler pointed at a stub registry, plus the
+// last request that registry saw.
+func newNPMAuditUpstream(t *testing.T, respond http.HandlerFunc) (*NPMHandler, *npmAuditCapture) {
+	t.Helper()
+
+	capture := &npmAuditCapture{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capture.method = r.Method
+		capture.path = r.URL.Path
+		capture.query = r.URL.RawQuery
+		capture.contentType = r.Header.Get("Content-Type")
+		capture.contentEncoding = r.Header.Get("Content-Encoding")
+		capture.authorization = r.Header.Get("Authorization")
+		capture.body, _ = io.ReadAll(r.Body)
+		respond(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	return NewNPMHandler(proxy, "http://proxy.test", upstream.URL), capture
+}
+
+type npmAuditCapture struct {
+	method          string
+	path            string
+	query           string
+	contentType     string
+	contentEncoding string
+	authorization   string
+	body            []byte
+}
+
+func npmAuditJSON(body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+func serveNPM(t *testing.T, h *NPMHandler, method, target string, body io.Reader,
+	headers map[string]string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(method, target, body)
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	return w
+}
+
+func TestNPMAuditRelaysRequestAndResponse(t *testing.T) {
+	const report = `{"actions":[],"advisories":{},"metadata":{"vulnerabilities":{"total":0}}}`
+	const payload = `{"name":"app","requires":{"lodash":"^4.17.21"},"dependencies":{}}`
+
+	h, got := newNPMAuditUpstream(t, npmAuditJSON(report))
+	w := serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits?foo=bar",
+		strings.NewReader(payload), map[string]string{"Content-Type": "application/json"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if w.Body.String() != report {
+		t.Errorf("body = %q, want %q", w.Body.String(), report)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("response Content-Type = %q, want application/json", ct)
+	}
+	if got.method != http.MethodPost {
+		t.Errorf("upstream method = %q, want POST", got.method)
+	}
+	if got.path != "/-/npm/v1/security/audits" {
+		t.Errorf("upstream path = %q, want /-/npm/v1/security/audits", got.path)
+	}
+	if got.query != "foo=bar" {
+		t.Errorf("upstream query = %q, want foo=bar", got.query)
+	}
+	if string(got.body) != payload {
+		t.Errorf("upstream body = %q, want %q", got.body, payload)
+	}
+	if got.contentType != "application/json" {
+		t.Errorf("upstream Content-Type = %q, want application/json", got.contentType)
+	}
+}
+
+// npm gzips its audit payload, so the bytes and the header describing them
+// must travel together.
+func TestNPMAuditForwardsGzippedBody(t *testing.T) {
+	var gzipped bytes.Buffer
+	zw := gzip.NewWriter(&gzipped)
+	if _, err := io.WriteString(zw, `{"name":"app"}`); err != nil {
+		t.Fatalf("writing gzip body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing gzip writer: %v", err)
+	}
+	want := gzipped.Bytes()
+
+	h, got := newNPMAuditUpstream(t, npmAuditJSON(`{}`))
+	w := serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits",
+		bytes.NewReader(want), map[string]string{
+			"Content-Type":     "application/json",
+			"Content-Encoding": "gzip",
+		})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got.contentEncoding != "gzip" {
+		t.Errorf("upstream Content-Encoding = %q, want gzip", got.contentEncoding)
+	}
+	if !bytes.Equal(got.body, want) {
+		t.Errorf("upstream body was altered: got %d bytes, want %d", len(got.body), len(want))
+	}
+}
+
+func TestNPMAuditCoversAllSecurityEndpoints(t *testing.T) {
+	paths := []string{
+		"/-/npm/v1/security/audits",          // pnpm audit, npm audit (full)
+		"/-/npm/v1/security/audits/quick",    // yarn npm audit, npm audit fallback
+		"/-/npm/v1/security/advisories/bulk", // npm audit (npm 7+)
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			h, got := newNPMAuditUpstream(t, npmAuditJSON(`{}`))
+			w := serveNPM(t, h, http.MethodPost, path, strings.NewReader(`{}`), nil)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+			}
+			if got.path != path {
+				t.Errorf("upstream path = %q, want %q", got.path, path)
+			}
+		})
+	}
+}
+
+func TestNPMAuditAppliesUpstreamAuth(t *testing.T) {
+	h, got := newNPMAuditUpstream(t, npmAuditJSON(`{}`))
+	h.proxy.AuthForURL = func(string) (string, string) {
+		return "Authorization", "Bearer npm-token"
+	}
+
+	serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits", strings.NewReader(`{}`), nil)
+
+	if got.authorization != "Bearer npm-token" {
+		t.Errorf("Authorization = %q, want %q", got.authorization, "Bearer npm-token")
+	}
+}
+
+func TestNPMAuditRelaysUpstreamError(t *testing.T) {
+	const upstreamBody = `{"error":"unauthorized"}`
+
+	h, _ := newNPMAuditUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, upstreamBody)
+	})
+	w := serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits", strings.NewReader(`{}`), nil)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+	if w.Body.String() != upstreamBody {
+		t.Errorf("body = %q, want %q", w.Body.String(), upstreamBody)
+	}
+}
+
+// A proxy-side failure must still be JSON, or the client reports it as a
+// malformed audit response.
+func TestNPMAuditUpstreamUnreachable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	upstreamURL := upstream.URL
+	upstream.Close() // nothing is listening now
+
+	proxy, _, _, _ := setupTestProxy(t)
+	h := NewNPMHandler(proxy, "http://proxy.test", upstreamURL)
+
+	w := serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits", strings.NewReader(`{}`), nil)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if !json.Valid(w.Body.Bytes()) {
+		t.Errorf("body is not valid JSON: %q", w.Body.String())
+	}
+}
+
+func TestNPMAuditRejectsBadRequests(t *testing.T) {
+	t.Run("non-POST method", func(t *testing.T) {
+		proxy, _, _, _ := setupTestProxy(t)
+		h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test")
+
+		w := serveNPM(t, h, http.MethodGet, "/-/npm/v1/security/audits", nil, nil)
+
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+		}
+		if !json.Valid(w.Body.Bytes()) {
+			t.Errorf("body is not valid JSON: %q", w.Body.String())
+		}
+	})
+
+	t.Run("body over the size cap", func(t *testing.T) {
+		proxy, _, _, _ := setupTestProxy(t)
+		h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test")
+
+		body := strings.NewReader(strings.Repeat("a", npmSecurityMaxBody+1))
+		w := serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits", body, nil)
+
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("status = %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
+		}
+	})
+
+	t.Run("unreadable body is not reported as too large", func(t *testing.T) {
+		proxy, _, _, _ := setupTestProxy(t)
+		h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test")
+
+		req := httptest.NewRequest(http.MethodPost, "/-/npm/v1/security/audits",
+			iotest.TimeoutReader(strings.NewReader("{}")))
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+		if !json.Valid(w.Body.Bytes()) {
+			t.Errorf("body is not valid JSON: %q", w.Body.String())
+		}
+	})
+}
+
+func TestNPMAuditDoesNotInjectUpstreamQuery(t *testing.T) {
+	h, got := newNPMAuditUpstream(t, npmAuditJSON(`{}`))
+
+	serveNPM(t, h, http.MethodPost,
+		"/-/npm/v1/security/audits%3Fevil=1", strings.NewReader(`{}`), nil)
+
+	if got.query != "" {
+		t.Errorf("upstream query = %q, want empty: encoded ? leaked into the query", got.query)
+	}
+	if got.path != "/-/npm/v1/security/audits?evil=1" {
+		t.Errorf("upstream path = %q, want the encoded ? kept in the path", got.path)
+	}
+}
+
+// The audit POST must go through relayResponse, not copy upstream headers
+// wholesale: a relayed Connection header would be honoured downstream.
+// TestRelayRoutes covers the GET paths; this covers the POST.
+func TestNPMAuditStripsHopByHopHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprint(rw, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"+
+			"Connection: X-Private\r\nX-Private: secret\r\nContent-Length: 2\r\n\r\n{}")
+		_ = rw.Flush()
+	}))
+	defer upstream.Close()
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	downstream := httptest.NewServer(NewNPMHandler(proxy, "http://proxy.test", upstream.URL).Routes())
+	defer downstream.Close()
+
+	resp, err := downstream.Client().Post(
+		downstream.URL+"/-/npm/v1/security/audits", contentTypeJSON, strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.Header.Get("Connection") != "" || resp.Header.Get("X-Private") != "" {
+		t.Errorf("connection-scoped headers leaked: %v", resp.Header)
+	}
+}
+
+// `npm audit signatures` reads the registry signing keys. The path used to fall
+// through to the package dispatch and be escaped into a package name.
+func TestNPMKeysProxiesUpstream(t *testing.T) {
+	const keys = `{"keys":[{"keyid":"SHA256:jl3bwswu","keytype":"ecdsa-sha2-nistp256"}]}`
+
+	var gotPath, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// EscapedPath, not Path: the bug escaped the slashes into a package
+		// name, and the server decodes %2F back into Path either way.
+		gotPath, gotAuth = r.URL.EscapedPath(), r.Header.Get("Authorization")
+		if gotPath != npmKeysPath {
+			w.WriteHeader(http.StatusMethodNotAllowed) // what registry.npmjs.org answers
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, keys)
+	}))
+	defer upstream.Close()
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	proxy.AuthForURL = func(string) (string, string) {
+		return "Authorization", "Bearer npm-token"
+	}
+	h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL)
+
+	w := serveNPM(t, h, http.MethodGet, npmKeysPath, nil, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if w.Body.String() != keys {
+		t.Errorf("body = %q, want %q", w.Body.String(), keys)
+	}
+	if gotPath != npmKeysPath {
+		t.Errorf("upstream path = %q, want %q", gotPath, npmKeysPath)
+	}
+	if gotAuth != "Bearer npm-token" {
+		t.Errorf("Authorization = %q, want it applied", gotAuth)
+	}
+}
+
+// Tarball paths share the /-/ prefix with the /-/npm/v1 endpoints.
+func TestNPMTarballStillRoutesToDownload(t *testing.T) {
+	proxy, _, _, artifactFetcher := setupTestProxy(t)
+	artifactFetcher.artifact = &fetch.Artifact{
+		Body:        io.NopCloser(strings.NewReader("package")),
+		ContentType: "application/gzip",
+	}
+	h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test")
+
+	w := serveNPM(t, h, http.MethodGet, "/lodash/-/lodash-4.17.21.tgz", nil, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
 	}
 }

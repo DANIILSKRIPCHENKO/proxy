@@ -96,6 +96,7 @@ func packagePURLStrings(ecosystem, name, version string) (string, string, error)
 const contentTypeJSON = "application/json"
 
 const (
+	headerAccept          = "Accept"
 	headerAcceptEncoding  = "Accept-Encoding"
 	headerContentType     = "Content-Type"
 	headerContentLength   = "Content-Length"

@@ -154,6 +154,13 @@ Or use environment variable:
 npm_config_registry=http://localhost:8080/npm/ npm install
 ```
 
+`npm audit`, `pnpm audit`, `yarn npm audit` and `npm audit signatures` work
+through the proxy: the audit and signing-key endpoints are passed through to the
+configured upstream registry, with upstream authentication applied. Advisories
+therefore come from upstream's database, not from the proxy's own vulnerability
+data, and versions withheld by [cooldown](#version-cooldown) are not excluded
+from the report.
+
 ### Cargo
 
 Create or edit `~/.cargo/config.toml`:
@@ -883,6 +890,8 @@ Recently cached:
 | `GET /stats` | Cache statistics (JSON) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /npm/*` | npm registry protocol |
+| `POST /npm/-/npm/v1/security/*` | npm/pnpm/Yarn audit endpoints, passed through to upstream |
+| `GET /npm/-/npm/v1/keys` | npm registry signing keys, passed through to upstream |
 | `GET /cargo/*` | Cargo sparse index protocol |
 | `GET /gem/*` | RubyGems protocol |
 | `GET /go/*` | Go module proxy protocol |
