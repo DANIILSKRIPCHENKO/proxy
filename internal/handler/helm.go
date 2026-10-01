@@ -115,8 +115,14 @@ func (h *HelmHandler) handleChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.proxy.GetOrFetchArtifactFromURL(
-		r.Context(), helmMetadataEcosystem, repository, digest, filename, downloadURL)
+	// A passthrough fetch is never stored, so serveChart's digest check has
+	// nothing to compare against: verify the stream itself instead.
+	expectedDigest := ""
+	if h.proxy.Passthrough {
+		expectedDigest = "sha256:" + digest
+	}
+	result, err := h.proxy.GetOrFetchArtifactFromURLWithDigest(
+		r.Context(), helmMetadataEcosystem, repository, digest, filename, downloadURL, expectedDigest)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch chart")
 		return

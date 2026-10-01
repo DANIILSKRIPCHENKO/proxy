@@ -171,8 +171,12 @@ type Proxy struct {
 	// URLs so clients receive a public address even when the proxy reaches
 	// storage at an internal one.
 	DirectServeBaseURL string
-	HTTPClient         *http.Client
-	AuthForURL         func(string) (headerName, headerValue string)
+	// Passthrough streams artifacts from upstream without storing them. Each
+	// request fetches its own copy: there is no cache to check and nothing
+	// for concurrent misses to share.
+	Passthrough bool
+	HTTPClient  *http.Client
+	AuthForURL  func(string) (headerName, headerValue string)
 
 	// Scanners runs pre-cache artifact scanning (e.g. trivy, ClamAV, Wiz).
 	// Nil or disabled means artifacts are cached without scanning.
@@ -241,6 +245,17 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 			return nil, errors.New("resolved artifact has no filename")
 		}
 	}
+	if p.Passthrough {
+		if info == nil {
+			if info, err = p.resolveArtifact(ctx, ecosystem, name, version); err != nil {
+				return nil, err
+			}
+		}
+		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, info.URL, "",
+			func(fetchCtx context.Context) (*fetch.Artifact, error) {
+				return p.Fetcher.Fetch(fetchCtx, info.URL)
+			})
+	}
 	if cached, err := p.checkCache(ctx, pkgPURL, versionPURL, filename); err != nil {
 		return nil, err
 	} else if cached != nil {
@@ -260,6 +275,9 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 // GetCachedArtifact retrieves an artifact from cache without contacting an upstream.
 // It returns nil when no usable cache entry exists.
 func (p *Proxy) GetCachedArtifact(ctx context.Context, ecosystem, name, version, filename string) (*CacheResult, error) {
+	if p.Passthrough {
+		return nil, nil
+	}
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return nil, err
@@ -763,7 +781,12 @@ func serveArtifact(w http.ResponseWriter, method string, result *CacheResult) {
 		buffer := artifactCopyBufferPool.Get().(*[]byte)
 		defer artifactCopyBufferPool.Put(buffer)
 		// Hide optional ReaderFrom methods so io.CopyBuffer uses the pooled buffer.
-		_, _ = io.CopyBuffer(struct{ io.Writer }{w}, result.Reader, *buffer)
+		_, err := io.CopyBuffer(struct{ io.Writer }{w}, result.Reader, *buffer)
+		if errors.Is(err, ErrArtifactDigestMismatch) {
+			// The bytes are already out. Aborting leaves the response
+			// unterminated, so the client discards it instead of using it.
+			panic(http.ErrAbortHandler)
+		}
 	}
 }
 
@@ -1319,6 +1342,12 @@ func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, eco
 	if p.versionDenied(ecosystem, name, version) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, canonicalVersionPURL(ecosystem, name, version))
 	}
+	if p.Passthrough {
+		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash,
+			func(fetchCtx context.Context) (*fetch.Artifact, error) {
+				return p.Fetcher.FetchWithHeaders(fetchCtx, downloadURL, headers)
+			})
+	}
 	if cached, err := p.getCachedArtifactWithUpstreamHash(ctx, pkgPURL, versionPURL, filename, upstreamHash); err != nil {
 		return nil, err
 	} else if cached != nil {
@@ -1399,6 +1428,61 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 	}
 
 	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, artifact)
+}
+
+// streamFromUpstream fetches an artifact for passthrough mode and hands its
+// body to the caller without storing it.
+//
+// With upstreamHash set the body is verified as it streams. The size is left
+// unknown so the response goes out chunked: a mismatch only shows at EOF,
+// after the bytes have been sent, and an unterminated chunked response is the
+// only way left to make the client reject them (see serveArtifact).
+func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
+	p.Logger.Info("streaming from upstream",
+		"ecosystem", ecosystem, "name", name, "version", version, "url", upstreamURL)
+
+	fetchStart := time.Now()
+	artifact, err := fetchArtifact(ctx)
+	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
+	if err != nil {
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		if errors.Is(err, fetch.ErrNotFound) {
+			return nil, ErrUpstreamNotFound
+		}
+		return nil, fmt.Errorf("fetching from upstream: %w", err)
+	}
+
+	result := &CacheResult{
+		Reader: artifact.Body,
+		Artifact: artifacts.Artifact{
+			PURL:      versionPURL,
+			Size:      artifact.Size,
+			Filename:  filename,
+			MediaType: artifact.ContentType,
+		},
+	}
+	if upstreamHash == "" {
+		return result, nil
+	}
+
+	hash := strings.ToLower(upstreamHash)
+	checks, err := newIntegrityChecks(hash, "")
+	if err != nil {
+		_ = artifact.Body.Close()
+		return nil, fmt.Errorf("parsing upstream digest: %w", err)
+	}
+	result.Reader, err = checks.wrapFailOnMismatch(artifact.Body, func(reason string) {
+		p.Logger.Error("streamed artifact failed integrity check",
+			"purl", versionPURL, "filename", filename, "url", upstreamURL, "reason", reason)
+		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem))
+	})
+	if err != nil {
+		_ = artifact.Body.Close()
+		return nil, err
+	}
+	result.Artifact.Digest = digest.Digest("sha256:" + hash)
+	result.Artifact.Size = -1
+	return result, nil
 }
 
 // ErrArtifactDigestMismatch indicates that fetched bytes did not match the

@@ -257,6 +257,7 @@ func (s *Server) serve(listener net.Listener) error {
 	proxy.DirectServe = s.cfg.Storage.DirectServe
 	proxy.DirectServeTTL = s.cfg.ParseDirectServeTTL()
 	proxy.DirectServeBaseURL = s.cfg.Storage.DirectServeBaseURL
+	proxy.Passthrough = s.cfg.Storage.Passthrough
 
 	// Create router with Chi
 	r := chi.NewRouter()

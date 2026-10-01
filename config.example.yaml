@@ -52,6 +52,12 @@ storage:
   # Empty or "0" means unlimited
   max_size: ""
 
+  # Stream artifact downloads from upstream without storing them. Metadata
+  # filtering, cooldown and the denylist still apply. Useful when another
+  # cache sits in front of the proxy. Incompatible with direct_serve,
+  # scanning and mirror_api.
+  passthrough: false
+
   # Redirect cached artifact downloads to presigned storage URLs (HTTP 302)
   # instead of streaming through the proxy. Only effective for S3, GCS, and Azure.
   # Leave disabled if clients reach the proxy through an authenticating gateway,

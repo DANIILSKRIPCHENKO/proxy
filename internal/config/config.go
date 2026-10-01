@@ -370,6 +370,13 @@ type StorageConfig struct {
 	// storage at an internal address (e.g. 127.0.0.1 or a Docker hostname)
 	// but clients must use a public one.
 	DirectServeBaseURL string `json:"direct_serve_base_url" yaml:"direct_serve_base_url"`
+
+	// Passthrough streams artifacts from upstream to the client without
+	// storing them. Metadata filtering, cooldown and the denylist still
+	// apply. Useful when another caching layer sits in front of the proxy.
+	// Incompatible with scanning, direct_serve and mirror_api, which all
+	// depend on stored artifacts.
+	Passthrough bool `json:"passthrough" yaml:"passthrough"`
 }
 
 // GradleConfig configures Gradle-specific features.
@@ -893,6 +900,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvBool(&c.Storage.DirectServe, "PROXY_STORAGE_DIRECT_SERVE")
 	setEnvString(&c.Storage.DirectServeTTL, "PROXY_STORAGE_DIRECT_SERVE_TTL")
 	setEnvString(&c.Storage.DirectServeBaseURL, "PROXY_STORAGE_DIRECT_SERVE_BASE_URL")
+	setEnvBool(&c.Storage.Passthrough, "PROXY_STORAGE_PASSTHROUGH")
 	setEnvString(&c.Database.Driver, "PROXY_DATABASE_DRIVER")
 	setEnvString(&c.Database.Path, "PROXY_DATABASE_PATH")
 	setEnvString(&c.Database.URL, "PROXY_DATABASE_URL")
@@ -1023,6 +1031,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.validatePassthrough(); err != nil {
+		return err
+	}
+
 	// Validate metadata TTL if specified
 	if c.MetadataTTL != "" && c.MetadataTTL != "0" {
 		if _, err := time.ParseDuration(c.MetadataTTL); err != nil {
@@ -1039,6 +1051,21 @@ func (c *Config) Validate() error {
 	}
 
 	return c.validateComponents()
+}
+
+func (c *Config) validatePassthrough() error {
+	if !c.Storage.Passthrough {
+		return nil
+	}
+	switch {
+	case c.Scanning.Enabled:
+		return fmt.Errorf("storage.passthrough cannot be combined with scanning.enabled: scanning needs stored artifacts")
+	case c.Storage.DirectServe:
+		return fmt.Errorf("storage.passthrough cannot be combined with storage.direct_serve: no artifacts are stored to redirect to")
+	case c.MirrorAPI:
+		return fmt.Errorf("storage.passthrough cannot be combined with mirror_api: mirrored artifacts would never be served")
+	}
+	return nil
 }
 
 func (c *Config) validateComponents() error {

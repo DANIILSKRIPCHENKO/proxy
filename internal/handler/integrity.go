@@ -40,6 +40,17 @@ func newIntegrityChecks(contentHash, native string) (integrityChecks, error) {
 }
 
 func (c integrityChecks) wrap(source io.ReadCloser, onMismatch func(string)) (io.ReadCloser, error) {
+	return c.newVerifyingReader(source, onMismatch, false)
+}
+
+// wrapFailOnMismatch is wrap for bytes that have not been checked anywhere
+// else: a mismatch is also returned from Read as ErrArtifactDigestMismatch in
+// place of io.EOF, so the caller can abort rather than complete the response.
+func (c integrityChecks) wrapFailOnMismatch(source io.ReadCloser, onMismatch func(string)) (io.ReadCloser, error) {
+	return c.newVerifyingReader(source, onMismatch, true)
+}
+
+func (c integrityChecks) newVerifyingReader(source io.ReadCloser, onMismatch func(string), failOnMismatch bool) (io.ReadCloser, error) {
 	if len(c.algorithms) == 0 {
 		return source, nil
 	}
@@ -48,10 +59,11 @@ func (c integrityChecks) wrap(source io.ReadCloser, onMismatch func(string)) (io
 		return nil, fmt.Errorf("create integrity reader: %w", err)
 	}
 	return &verifyingReader{
-		source:     source,
-		reader:     reader,
-		checks:     c,
-		onMismatch: onMismatch,
+		source:         source,
+		reader:         reader,
+		checks:         c,
+		onMismatch:     onMismatch,
+		failOnMismatch: failOnMismatch,
 	}, nil
 }
 
@@ -63,12 +75,18 @@ type verifyingReader struct {
 	checks     integrityChecks
 	onMismatch func(reason string)
 	verified   bool
+
+	failOnMismatch bool
+	mismatched     bool
 }
 
 func (r *verifyingReader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	if err == io.EOF {
 		r.verify()
+		if r.failOnMismatch && r.mismatched {
+			return n, ErrArtifactDigestMismatch
+		}
 	}
 	return n, err
 }
@@ -89,11 +107,13 @@ func (r *verifyingReader) verify() {
 
 	if len(r.checks.contentHash) > 0 {
 		if err := result.Verify(r.checks.contentHash); err != nil {
+			r.mismatched = true
 			r.onMismatch("content_hash: " + err.Error())
 		}
 	}
 	if len(r.checks.native) > 0 {
 		if err := result.Verify(r.checks.native); err != nil {
+			r.mismatched = true
 			r.onMismatch("integrity: " + err.Error())
 		}
 	}
