@@ -82,9 +82,11 @@ func testRelayRoute(t *testing.T, route string, truncated bool) {
 		if !truncated {
 			_, _ = fmt.Fprint(rw, "0\r\nX-Checksum: verified\r\nX-Late: discovered-at-eof\r\nX-Private: still-secret\r\n\r\n")
 		}
-		if err := rw.Flush(); err != nil {
-			t.Error(err)
-		}
+		// Two of these routes fan out a second upstream request for cooldown
+		// timestamps and abandon its body on a non-200, so this may be writing to
+		// a connection the proxy has already dropped. What the proxy made of the
+		// response under test is asserted downstream.
+		_ = rw.Flush()
 	}))
 	defer upstream.Close()
 	proxy := testProxy()
