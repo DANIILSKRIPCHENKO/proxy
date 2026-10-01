@@ -124,6 +124,56 @@ func TestLoggerMiddlewareRecordsRequestMetrics(t *testing.T) {
 	}
 }
 
+// A relayed response that is truncated after its headers aborts the handler
+// with http.ErrAbortHandler. The request still has to reach the metrics and the
+// access log, or a truncated download is recorded nowhere at all.
+func TestLoggerMiddlewareRecordsAbortedRequest(t *testing.T) {
+	before := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("npm", "200"))
+
+	path := filepath.Join(t.TempDir(), "access.jsonl")
+	activityLog, err := accesslog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := &Server{logger: logger, accessLog: activityLog}
+	handler := s.LoggerMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		panic(http.ErrAbortHandler)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/npm/example/-/example-1.0.0.tgz", nil)
+	rec := httptest.NewRecorder()
+	func() {
+		defer func() {
+			if rvr := recover(); rvr != http.ErrAbortHandler {
+				t.Errorf("recovered %v, want the abort to propagate", rvr)
+			}
+		}()
+		handler.ServeHTTP(rec, req)
+	}()
+
+	if got := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("npm", "200")) - before; got != 1 {
+		t.Errorf("request counter delta = %.0f, want 1", got)
+	}
+
+	if err := activityLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry accesslog.Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("decoding access log: %v", err)
+	}
+	if entry.Path != "/npm/example/-/example-1.0.0.tgz" {
+		t.Errorf("path = %q, want the aborted request logged", entry.Path)
+	}
+}
+
 func histogramSampleCount(t *testing.T, observer prometheus.Observer) uint64 {
 	t.Helper()
 

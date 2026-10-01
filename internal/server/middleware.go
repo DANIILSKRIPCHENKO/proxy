@@ -43,34 +43,41 @@ func (s *Server) LoggerMiddleware(next http.Handler) http.Handler {
 		requestID := GetRequestID(r.Context())
 
 		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rw, r)
-		duration := time.Since(start)
 
-		s.logger.Info("request",
-			"request_id", requestID,
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", rw.status,
-			"duration", duration,
-			"remote", r.RemoteAddr)
+		// Deferred because a truncated upstream relay aborts the handler with
+		// http.ErrAbortHandler, which would otherwise leave the request out of
+		// the log, the metrics and the access log entirely.
+		defer func() {
+			duration := time.Since(start)
 
-		if r.URL.Path != "/metrics" {
-			metrics.RecordRequest(requestEcosystem(r.URL.Path), rw.status, duration)
-		}
+			s.logger.Info("request",
+				"request_id", requestID,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rw.status,
+				"duration", duration,
+				"remote", r.RemoteAddr)
 
-		if s.accessLog != nil {
-			if err := s.accessLog.Write(accesslog.Entry{
-				Event:      accesslog.EventRequest,
-				RequestID:  requestID,
-				Method:     r.Method,
-				Path:       r.URL.EscapedPath(),
-				StatusCode: rw.status,
-				DurationMS: duration.Milliseconds(),
-				RemoteAddr: r.RemoteAddr,
-			}); err != nil {
-				s.logger.Error("failed to write access log", "error", err)
+			if r.URL.Path != "/metrics" {
+				metrics.RecordRequest(requestEcosystem(r.URL.Path), rw.status, duration)
 			}
-		}
+
+			if s.accessLog != nil {
+				if err := s.accessLog.Write(accesslog.Entry{
+					Event:      accesslog.EventRequest,
+					RequestID:  requestID,
+					Method:     r.Method,
+					Path:       r.URL.EscapedPath(),
+					StatusCode: rw.status,
+					DurationMS: duration.Milliseconds(),
+					RemoteAddr: r.RemoteAddr,
+				}); err != nil {
+					s.logger.Error("failed to write access log", "error", err)
+				}
+			}
+		}()
+
+		next.ServeHTTP(rw, r)
 	})
 }
 
