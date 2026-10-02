@@ -276,9 +276,6 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 // GetCachedArtifact retrieves an artifact from cache without contacting an upstream.
 // It returns nil when no usable cache entry exists.
 func (p *Proxy) GetCachedArtifact(ctx context.Context, ecosystem, name, version, filename string) (*CacheResult, error) {
-	if p.Passthrough {
-		return nil, nil
-	}
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return nil, err
@@ -307,9 +304,14 @@ func (p *Proxy) ClearCachedArtifact(ecosystem, name, version, filename string) e
 }
 
 // checkCache looks up an artifact in the cache. Returns nil if not cached.
+// In passthrough mode it always reports a miss, so entries stored before the
+// mode was enabled are never served.
 func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename string) (*CacheResult, error) {
 	if p.Denylist.Denied(versionPURL) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
+	}
+	if p.Passthrough {
+		return nil, nil
 	}
 	artifact, err := p.DB.GetCachedArtifact(pkgPURL, versionPURL, filename)
 	if err != nil {
@@ -782,10 +784,12 @@ func serveArtifact(w http.ResponseWriter, method string, result *CacheResult) {
 		buffer := artifactCopyBufferPool.Get().(*[]byte)
 		defer artifactCopyBufferPool.Put(buffer)
 		// Hide optional ReaderFrom methods so io.CopyBuffer uses the pooled buffer.
-		_, err := io.CopyBuffer(struct{ io.Writer }{w}, result.Reader, *buffer)
-		if errors.Is(err, ErrArtifactDigestMismatch) {
-			// The bytes are already out. Aborting leaves the response
-			// unterminated, so the client discards it instead of using it.
+		written, err := io.CopyBuffer(struct{ io.Writer }{w}, result.Reader, *buffer)
+		if err != nil || (result.Artifact.Size > 0 && written != result.Artifact.Size) {
+			// Headers are already committed, so an error status is no longer
+			// possible. Aborting leaves the response unterminated and the
+			// client discards it instead of keeping a truncated or unverified
+			// artifact.
 			panic(http.ErrAbortHandler)
 		}
 	}
@@ -1453,8 +1457,16 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		return nil, fmt.Errorf("fetching from upstream: %w", err)
 	}
 
+	body := &streamErrorLogger{
+		ReadCloser: artifact.Body,
+		onError: func(read int64, err error) {
+			p.Logger.Warn("streaming artifact from upstream failed",
+				"purl", versionPURL, "filename", filename, "url", upstreamURL, "bytes", read, "error", err)
+			metrics.RecordUpstreamError(ecosystem, "stream_failed")
+		},
+	}
 	result := &CacheResult{
-		Reader: artifact.Body,
+		Reader: body,
 		Artifact: artifacts.Artifact{
 			PURL:      versionPURL,
 			Size:      artifact.Size,
@@ -1472,7 +1484,7 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		_ = artifact.Body.Close()
 		return nil, fmt.Errorf("parsing upstream digest: %w", err)
 	}
-	result.Reader, err = checks.wrapFailOnMismatch(artifact.Body, func(reason string) {
+	result.Reader, err = checks.wrapFailOnMismatch(body, func(reason string) {
 		p.Logger.Error("streamed artifact failed integrity check",
 			"purl", versionPURL, "filename", filename, "url", upstreamURL, "reason", reason)
 		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem))
@@ -1484,6 +1496,25 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 	result.Artifact.Digest = digest.Digest("sha256:" + hash)
 	result.Artifact.Size = -1
 	return result, nil
+}
+
+// streamErrorLogger reports the first read error of a streamed upstream body.
+// The error itself still reaches serveArtifact, which aborts the response.
+type streamErrorLogger struct {
+	io.ReadCloser
+	onError func(read int64, err error)
+	read    int64
+	logged  bool
+}
+
+func (r *streamErrorLogger) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.read += int64(n)
+	if err != nil && err != io.EOF && !r.logged {
+		r.logged = true
+		r.onError(r.read, err)
+	}
+	return n, err
 }
 
 // ErrArtifactDigestMismatch indicates that fetched bytes did not match the

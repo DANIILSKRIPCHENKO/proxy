@@ -1304,7 +1304,7 @@ func TestValidateNamedUpstreams(t *testing.T) {
 	}
 }
 
-func TestValidatePassthrough(t *testing.T) {
+func TestValidateCacheArtifactsDisabled(t *testing.T) {
 	tests := []struct {
 		name    string
 		modify  func(*Config)
@@ -1318,7 +1318,7 @@ func TestValidatePassthrough(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Default()
-			cfg.Storage.Passthrough = true
+			cfg.Storage.CacheArtifacts = false
 			tt.modify(cfg)
 			err := cfg.Validate()
 			if tt.wantErr == "" {
@@ -1334,12 +1334,30 @@ func TestValidatePassthrough(t *testing.T) {
 	}
 }
 
-func TestLoadPassthroughFromEnv(t *testing.T) {
+func TestCacheArtifactsDefaultsToTrue(t *testing.T) {
+	if !Default().Storage.CacheArtifacts {
+		t.Fatal("Default().Storage.CacheArtifacts = false, want true")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("storage:\n  url: \"file:///tmp/cache\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Storage.CacheArtifacts {
+		t.Error("a config file without storage.cache_artifacts disabled artifact caching")
+	}
+}
+
+func TestLoadCacheArtifactsFromEnv(t *testing.T) {
 	cfg := Default()
-	t.Setenv("PROXY_STORAGE_PASSTHROUGH", "true")
+	t.Setenv("PROXY_STORAGE_CACHE_ARTIFACTS", "false")
 	cfg.LoadFromEnv()
 
-	if !cfg.Storage.Passthrough {
-		t.Error("Storage.Passthrough should be true")
+	if cfg.Storage.CacheArtifacts {
+		t.Error("Storage.CacheArtifacts should be false")
 	}
 }

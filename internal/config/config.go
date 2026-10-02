@@ -371,12 +371,13 @@ type StorageConfig struct {
 	// but clients must use a public one.
 	DirectServeBaseURL string `json:"direct_serve_base_url" yaml:"direct_serve_base_url"`
 
-	// Passthrough streams artifacts from upstream to the client without
-	// storing them. Metadata filtering, cooldown and the denylist still
-	// apply. Useful when another caching layer sits in front of the proxy.
-	// Incompatible with scanning, direct_serve and mirror_api, which all
-	// depend on stored artifacts.
-	Passthrough bool `json:"passthrough" yaml:"passthrough"`
+	// CacheArtifacts stores fetched artifacts so later downloads are served
+	// from storage. When false, every download streams from upstream and
+	// nothing is stored; metadata is still cached, and cooldown and the
+	// denylist still apply. Useful when another caching layer sits in front
+	// of the proxy. False is incompatible with scanning, direct_serve and
+	// mirror_api, which all depend on stored artifacts. Default: true.
+	CacheArtifacts bool `json:"cache_artifacts" yaml:"cache_artifacts"`
 }
 
 // GradleConfig configures Gradle-specific features.
@@ -764,8 +765,9 @@ func Default() *Config {
 		Listen:  ":8080",
 		BaseURL: "http://localhost:8080",
 		Storage: StorageConfig{
-			Path:    "./cache/artifacts",
-			MaxSize: "",
+			Path:           "./cache/artifacts",
+			MaxSize:        "",
+			CacheArtifacts: true,
 		},
 		Database: DatabaseConfig{
 			Driver: "sqlite",
@@ -900,7 +902,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvBool(&c.Storage.DirectServe, "PROXY_STORAGE_DIRECT_SERVE")
 	setEnvString(&c.Storage.DirectServeTTL, "PROXY_STORAGE_DIRECT_SERVE_TTL")
 	setEnvString(&c.Storage.DirectServeBaseURL, "PROXY_STORAGE_DIRECT_SERVE_BASE_URL")
-	setEnvBool(&c.Storage.Passthrough, "PROXY_STORAGE_PASSTHROUGH")
+	setEnvBool(&c.Storage.CacheArtifacts, "PROXY_STORAGE_CACHE_ARTIFACTS")
 	setEnvString(&c.Database.Driver, "PROXY_DATABASE_DRIVER")
 	setEnvString(&c.Database.Path, "PROXY_DATABASE_PATH")
 	setEnvString(&c.Database.URL, "PROXY_DATABASE_URL")
@@ -1031,7 +1033,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if err := c.validatePassthrough(); err != nil {
+	if err := c.validateCacheArtifacts(); err != nil {
 		return err
 	}
 
@@ -1053,17 +1055,17 @@ func (c *Config) Validate() error {
 	return c.validateComponents()
 }
 
-func (c *Config) validatePassthrough() error {
-	if !c.Storage.Passthrough {
+func (c *Config) validateCacheArtifacts() error {
+	if c.Storage.CacheArtifacts {
 		return nil
 	}
 	switch {
 	case c.Scanning.Enabled:
-		return fmt.Errorf("storage.passthrough cannot be combined with scanning.enabled: scanning needs stored artifacts")
+		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with scanning.enabled: scanning needs stored artifacts")
 	case c.Storage.DirectServe:
-		return fmt.Errorf("storage.passthrough cannot be combined with storage.direct_serve: no artifacts are stored to redirect to")
+		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with storage.direct_serve: no artifacts are stored to redirect to")
 	case c.MirrorAPI:
-		return fmt.Errorf("storage.passthrough cannot be combined with mirror_api: mirrored artifacts would never be served")
+		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with mirror_api: mirrored artifacts would never be served")
 	}
 	return nil
 }

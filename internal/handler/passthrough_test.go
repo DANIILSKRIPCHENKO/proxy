@@ -2,7 +2,10 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/git-pkgs/artifacts"
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/proxy/internal/packageurl"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -239,5 +244,168 @@ func TestNPMDownloadCooldownPassthrough(t *testing.T) {
 				t.Errorf("passthrough stored %d files, want none", len(store.files))
 			}
 		})
+	}
+}
+
+// truncatingUpstream answers every request matching match with raw, then
+// closes the connection, so the response body ends early.
+func truncatingUpstream(t *testing.T, match func(*http.Request) bool, raw string, fallback http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !match(r) {
+			fallback(w, r)
+			return
+		}
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_, _ = buf.WriteString(raw)
+		_ = buf.Flush()
+		_ = conn.Close()
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream
+}
+
+// requireIncompleteResponse fails unless reading the response surfaces an error,
+// i.e. the client cannot mistake the body for a complete download.
+func requireIncompleteResponse(t *testing.T, url string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatalf("client read a complete %d response (Content-Length %q, body %q), want an incomplete one",
+			resp.StatusCode, resp.Header.Get(headerContentLength), body)
+	}
+}
+
+func useRealFetcher(t *testing.T, proxy *Proxy, upstream *httptest.Server) {
+	t.Helper()
+	proxy.HTTPClient = upstream.Client()
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(upstream.Client()), fetch.WithMaxRetries(0))
+	proxy.Fetcher = fetcher
+	t.Cleanup(func() { _ = fetcher.Close() })
+}
+
+func TestPassthroughOCIBlobShorterThanContentLengthIsIncomplete(t *testing.T) {
+	digest := "sha256:" + sha256Hex(strings.Repeat("x", 100))
+	upstream := truncatingUpstream(t,
+		func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/blobs/") },
+		"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 100\r\n\r\nshort",
+		http.NotFound)
+
+	proxy, _, store, _ := setupTestProxy(t)
+	proxy.Passthrough = true
+	useRealFetcher(t, proxy, upstream)
+	h := NewContainerHandler(proxy, "http://proxy.example", map[string]string{"ghcr": upstream.URL})
+	srv := httptest.NewServer(h.Routes())
+	defer srv.Close()
+
+	requireIncompleteResponse(t, srv.URL+"/upstream/ghcr/owner/demo/blobs/"+digest)
+	if len(store.files) != 0 {
+		t.Errorf("passthrough stored %d files, want none", len(store.files))
+	}
+}
+
+func TestPassthroughNPMTarballWithoutFinalChunkIsIncomplete(t *testing.T) {
+	upstream := truncatingUpstream(t,
+		func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, ".tgz") },
+		"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
+		http.NotFound)
+
+	proxy, _, store, _ := setupTestProxy(t)
+	proxy.Passthrough = true
+	useRealFetcher(t, proxy, upstream)
+	srv := httptest.NewServer(NewNPMHandler(proxy, "http://proxy.test", upstream.URL).Routes())
+	defer srv.Close()
+
+	requireIncompleteResponse(t, srv.URL+"/leftpad/-/leftpad-1.0.0.tgz")
+	if len(store.files) != 0 {
+		t.Errorf("passthrough stored %d files, want none", len(store.files))
+	}
+}
+
+func TestServeArtifactAbortsOnShortRead(t *testing.T) {
+	tests := []struct {
+		name   string
+		reader io.Reader
+		size   int64
+	}{
+		{"read error", io.MultiReader(strings.NewReader("short"), iotestErrReader{io.ErrUnexpectedEOF}), -1},
+		{"fewer bytes than the declared size", strings.NewReader("short"), 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := &CacheResult{Reader: io.NopCloser(tt.reader), Artifact: artifacts.Artifact{Size: tt.size}}
+			defer func() {
+				if r := recover(); r != http.ErrAbortHandler {
+					t.Fatalf("recovered %v, want http.ErrAbortHandler", r)
+				}
+			}()
+			ServeArtifact(httptest.NewRecorder(), result)
+		})
+	}
+}
+
+type iotestErrReader struct{ err error }
+
+func (r iotestErrReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestPassthroughSwiftArchiveHeadIgnoresCachedEntry(t *testing.T) {
+	archive := []byte("cached archive")
+	checksum := sha256.Sum256(archive)
+	var archiveRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".zip") {
+			archiveRequests++
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"apple.example","version":"1.2.3","resources":[{"name":"source-archive","type":"application/zip","checksum":%q}]}`, hex.EncodeToString(checksum[:]))
+	}))
+	defer upstream.Close()
+
+	proxy, _, _, fetcher := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	fetcher.artifact = &fetch.Artifact{
+		Body:        io.NopCloser(strings.NewReader(string(archive))),
+		Size:        int64(len(archive)),
+		ContentType: "application/zip",
+	}
+	packagePURL, versionPURL := packageurl.MakeCacheStrings("swift", "apple/example", "1.2.3")
+	cached, err := proxy.getOrFetchArtifactFromURLWithCachePURLs(
+		context.Background(), "swift", "apple/example", "1.2.3", "example-1.2.3.zip",
+		packagePURL, versionPURL, upstream.URL+"/apple/example/1.2.3.zip", nil, hex.EncodeToString(checksum[:]),
+	)
+	if err != nil {
+		t.Fatalf("seeding cache in normal mode: %v", err)
+	}
+	_ = cached.Reader.Close()
+
+	proxy.Passthrough = true
+	fetcher.artifact = nil
+	fetcher.fetchErr = fetch.ErrNotFound
+	handler := NewSwiftHandler(proxy, "https://proxy.example", upstream.URL).Routes()
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/apple/example/1.2.3.zip", nil))
+	if w.Code == http.StatusOK {
+		t.Fatalf("HEAD served the cached archive (Content-Length %q) in passthrough mode", w.Header().Get(headerContentLength))
+	}
+	if archiveRequests == 0 {
+		t.Error("HEAD did not ask the upstream archive")
+	}
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apple/example/1.2.3.zip", nil))
+	if w.Code == http.StatusOK {
+		t.Fatalf("GET served the cached archive in passthrough mode")
 	}
 }
