@@ -19,10 +19,10 @@ import (
 	"github.com/git-pkgs/registries/fetch"
 )
 
-func newPassthroughProxy(t *testing.T, body string) (*Proxy, *mockStorage, *mockFetcher) {
+func newStreamingProxy(t *testing.T, body string) (*Proxy, *mockStorage, *mockFetcher) {
 	t.Helper()
 	proxy, _, store, fetcher := setupTestProxy(t)
-	proxy.Passthrough = true
+	proxy.StreamArtifacts = true
 	fetcher.artifact = &fetch.Artifact{
 		Body:        io.NopCloser(strings.NewReader(body)),
 		Size:        int64(len(body)),
@@ -31,8 +31,8 @@ func newPassthroughProxy(t *testing.T, body string) (*Proxy, *mockStorage, *mock
 	return proxy, store, fetcher
 }
 
-func TestPassthroughFromURLStreamsWithoutStoring(t *testing.T) {
-	proxy, store, fetcher := newPassthroughProxy(t, "fetched content")
+func TestStreamArtifactsFromURLStreamsWithoutStoring(t *testing.T) {
+	proxy, store, fetcher := newStreamingProxy(t, "fetched content")
 
 	result, err := proxy.GetOrFetchArtifactFromURL(context.Background(), "pypi", "newpkg", "1.0.0",
 		"newpkg-1.0.0.tar.gz", "https://pypi.org/files/newpkg-1.0.0.tar.gz")
@@ -52,7 +52,7 @@ func TestPassthroughFromURLStreamsWithoutStoring(t *testing.T) {
 		t.Errorf("fetched URL = %q", fetcher.fetchedURL)
 	}
 	if result.Cached {
-		t.Error("passthrough result reported as cached")
+		t.Error("streaming result reported as cached")
 	}
 	if result.Artifact.Size != int64(len("fetched content")) {
 		t.Errorf("Size = %d, want the upstream size", result.Artifact.Size)
@@ -61,19 +61,19 @@ func TestPassthroughFromURLStreamsWithoutStoring(t *testing.T) {
 		t.Errorf("MediaType = %q", result.Artifact.MediaType)
 	}
 	if len(store.files) != 0 {
-		t.Errorf("passthrough stored %d files, want none", len(store.files))
+		t.Errorf("streaming stored %d files, want none", len(store.files))
 	}
 	cached, err := proxy.DB.GetCachedArtifact("pkg:pypi/newpkg", "pkg:pypi/newpkg@1.0.0", "newpkg-1.0.0.tar.gz")
 	if err != nil {
 		t.Fatalf("GetCachedArtifact: %v", err)
 	}
 	if cached != nil {
-		t.Error("passthrough recorded the artifact in the cache database")
+		t.Error("streaming recorded the artifact in the cache database")
 	}
 }
 
-func TestPassthroughGetOrFetchArtifactStreamsWithoutStoring(t *testing.T) {
-	proxy, store, fetcher := newPassthroughProxy(t, "tarball data")
+func TestStreamArtifactsGetOrFetchArtifactStreamsWithoutStoring(t *testing.T) {
+	proxy, store, fetcher := newStreamingProxy(t, "tarball data")
 
 	result, err := proxy.GetOrFetchArtifact(context.Background(), "npm", "leftpad", testVersion100, "leftpad-1.0.0.tgz")
 	if err != nil {
@@ -89,11 +89,11 @@ func TestPassthroughGetOrFetchArtifactStreamsWithoutStoring(t *testing.T) {
 		t.Error("upstream was not fetched")
 	}
 	if len(store.files) != 0 {
-		t.Errorf("passthrough stored %d files, want none", len(store.files))
+		t.Errorf("streaming stored %d files, want none", len(store.files))
 	}
 }
 
-func TestPassthroughIgnoresCachedArtifacts(t *testing.T) {
+func TestStreamArtifactsIgnoresCachedArtifacts(t *testing.T) {
 	proxy, _, store, fetcher := setupTestProxy(t)
 	fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("old bytes"))}
 	url := "https://pypi.org/files/newpkg-1.0.0.tar.gz"
@@ -108,10 +108,10 @@ func TestPassthroughIgnoresCachedArtifacts(t *testing.T) {
 		t.Fatalf("expected the cache to hold the artifact, got %d files", len(store.files))
 	}
 
-	proxy.Passthrough = true
+	proxy.StreamArtifacts = true
 	cached, err := proxy.GetCachedArtifact(context.Background(), "pypi", "newpkg", "1.0.0", "newpkg-1.0.0.tar.gz")
 	if err != nil || cached != nil {
-		t.Fatalf("GetCachedArtifact = %v, %v; want nil, nil in passthrough", cached, err)
+		t.Fatalf("GetCachedArtifact = %v, %v; want nil, nil while streaming", cached, err)
 	}
 
 	fetcher.fetchCalled = false
@@ -123,15 +123,15 @@ func TestPassthroughIgnoresCachedArtifacts(t *testing.T) {
 	defer func() { _ = result.Reader.Close() }()
 	body, _ := io.ReadAll(result.Reader)
 	if !fetcher.fetchCalled || string(body) != "new bytes" {
-		t.Errorf("passthrough served %q (fetched=%v), want a fresh upstream fetch", body, fetcher.fetchCalled)
+		t.Errorf("streaming served %q (fetched=%v), want a fresh upstream fetch", body, fetcher.fetchCalled)
 	}
 }
 
-func TestPassthroughVerifiesUpstreamDigest(t *testing.T) {
+func TestStreamArtifactsVerifiesUpstreamDigest(t *testing.T) {
 	const content = "blob bytes"
 
 	t.Run("matching digest streams the body", func(t *testing.T) {
-		proxy, _, _ := newPassthroughProxy(t, content)
+		proxy, _, _ := newStreamingProxy(t, content)
 		result, err := proxy.GetOrFetchArtifactFromURLWithDigest(context.Background(), "oci", "library/app", "v1",
 			"blob", "https://registry.test/blob", "sha256:"+sha256Hex(content))
 		if err != nil {
@@ -155,7 +155,7 @@ func TestPassthroughVerifiesUpstreamDigest(t *testing.T) {
 	})
 
 	t.Run("mismatched digest fails the read", func(t *testing.T) {
-		proxy, _, _ := newPassthroughProxy(t, content)
+		proxy, _, _ := newStreamingProxy(t, content)
 		result, err := proxy.GetOrFetchArtifactFromURLWithDigest(context.Background(), "oci", "library/app", "v1",
 			"blob", "https://registry.test/blob", "sha256:"+sha256Hex("other bytes"))
 		if err != nil {
@@ -169,8 +169,8 @@ func TestPassthroughVerifiesUpstreamDigest(t *testing.T) {
 	})
 }
 
-func TestServeArtifactAbortsOnPassthroughDigestMismatch(t *testing.T) {
-	proxy, _, _ := newPassthroughProxy(t, "blob bytes")
+func TestServeArtifactAbortsOnStreamedDigestMismatch(t *testing.T) {
+	proxy, _, _ := newStreamingProxy(t, "blob bytes")
 	result, err := proxy.GetOrFetchArtifactFromURLWithDigest(context.Background(), "oci", "library/app", "v1",
 		"blob", "https://registry.test/blob", "sha256:"+sha256Hex("other bytes"))
 	if err != nil {
@@ -190,7 +190,7 @@ func TestServeArtifactAbortsOnPassthroughDigestMismatch(t *testing.T) {
 	ServeArtifact(rec, result)
 }
 
-func TestNPMDownloadCooldownPassthrough(t *testing.T) {
+func TestNPMDownloadCooldownWhileStreaming(t *testing.T) {
 	now := time.Now()
 	packument := `{
 		"name": "leftpad",
@@ -217,7 +217,7 @@ func TestNPMDownloadCooldownPassthrough(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proxy, store, fetcher := newPassthroughProxy(t, "tarball data")
+			proxy, store, fetcher := newStreamingProxy(t, "tarball data")
 			proxy.HTTPClient = upstream.Client()
 			proxy.Cooldown = &cooldown.Config{Default: "7d"}
 
@@ -241,7 +241,7 @@ func TestNPMDownloadCooldownPassthrough(t *testing.T) {
 				t.Error("fetched a version that is still inside the cooldown window")
 			}
 			if len(store.files) != 0 {
-				t.Errorf("passthrough stored %d files, want none", len(store.files))
+				t.Errorf("streaming stored %d files, want none", len(store.files))
 			}
 		})
 	}
@@ -293,7 +293,7 @@ func useRealFetcher(t *testing.T, proxy *Proxy, upstream *httptest.Server) {
 	t.Cleanup(func() { _ = fetcher.Close() })
 }
 
-func TestPassthroughOCIBlobShorterThanContentLengthIsIncomplete(t *testing.T) {
+func TestStreamArtifactsOCIBlobShorterThanContentLengthIsIncomplete(t *testing.T) {
 	digest := "sha256:" + sha256Hex(strings.Repeat("x", 100))
 	upstream := truncatingUpstream(t,
 		func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/blobs/") },
@@ -301,7 +301,7 @@ func TestPassthroughOCIBlobShorterThanContentLengthIsIncomplete(t *testing.T) {
 		http.NotFound)
 
 	proxy, _, store, _ := setupTestProxy(t)
-	proxy.Passthrough = true
+	proxy.StreamArtifacts = true
 	useRealFetcher(t, proxy, upstream)
 	h := NewContainerHandler(proxy, "http://proxy.example", map[string]string{"ghcr": upstream.URL})
 	srv := httptest.NewServer(h.Routes())
@@ -309,25 +309,25 @@ func TestPassthroughOCIBlobShorterThanContentLengthIsIncomplete(t *testing.T) {
 
 	requireIncompleteResponse(t, srv.URL+"/upstream/ghcr/owner/demo/blobs/"+digest)
 	if len(store.files) != 0 {
-		t.Errorf("passthrough stored %d files, want none", len(store.files))
+		t.Errorf("streaming stored %d files, want none", len(store.files))
 	}
 }
 
-func TestPassthroughNPMTarballWithoutFinalChunkIsIncomplete(t *testing.T) {
+func TestStreamArtifactsNPMTarballWithoutFinalChunkIsIncomplete(t *testing.T) {
 	upstream := truncatingUpstream(t,
 		func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, ".tgz") },
 		"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
 		http.NotFound)
 
 	proxy, _, store, _ := setupTestProxy(t)
-	proxy.Passthrough = true
+	proxy.StreamArtifacts = true
 	useRealFetcher(t, proxy, upstream)
 	srv := httptest.NewServer(NewNPMHandler(proxy, "http://proxy.test", upstream.URL).Routes())
 	defer srv.Close()
 
 	requireIncompleteResponse(t, srv.URL+"/leftpad/-/leftpad-1.0.0.tgz")
 	if len(store.files) != 0 {
-		t.Errorf("passthrough stored %d files, want none", len(store.files))
+		t.Errorf("streaming stored %d files, want none", len(store.files))
 	}
 }
 
@@ -357,7 +357,7 @@ type iotestErrReader struct{ err error }
 
 func (r iotestErrReader) Read([]byte) (int, error) { return 0, r.err }
 
-func TestPassthroughSwiftArchiveHeadIgnoresCachedEntry(t *testing.T) {
+func TestStreamArtifactsSwiftArchiveHeadIgnoresCachedEntry(t *testing.T) {
 	archive := []byte("cached archive")
 	checksum := sha256.Sum256(archive)
 	var archiveRequests int
@@ -389,7 +389,7 @@ func TestPassthroughSwiftArchiveHeadIgnoresCachedEntry(t *testing.T) {
 	}
 	_ = cached.Reader.Close()
 
-	proxy.Passthrough = true
+	proxy.StreamArtifacts = true
 	fetcher.artifact = nil
 	fetcher.fetchErr = fetch.ErrNotFound
 	handler := NewSwiftHandler(proxy, "https://proxy.example", upstream.URL).Routes()
@@ -397,7 +397,7 @@ func TestPassthroughSwiftArchiveHeadIgnoresCachedEntry(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/apple/example/1.2.3.zip", nil))
 	if w.Code == http.StatusOK {
-		t.Fatalf("HEAD served the cached archive (Content-Length %q) in passthrough mode", w.Header().Get(headerContentLength))
+		t.Fatalf("HEAD served the cached archive (Content-Length %q) while streaming artifacts", w.Header().Get(headerContentLength))
 	}
 	if archiveRequests == 0 {
 		t.Error("HEAD did not ask the upstream archive")
@@ -406,6 +406,6 @@ func TestPassthroughSwiftArchiveHeadIgnoresCachedEntry(t *testing.T) {
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apple/example/1.2.3.zip", nil))
 	if w.Code == http.StatusOK {
-		t.Fatalf("GET served the cached archive in passthrough mode")
+		t.Fatalf("GET served the cached archive while streaming artifacts")
 	}
 }

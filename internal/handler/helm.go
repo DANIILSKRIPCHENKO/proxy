@@ -115,10 +115,10 @@ func (h *HelmHandler) handleChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A passthrough fetch is never stored, so serveChart's digest check has
+	// A streamed fetch is never stored, so serveChart's digest check has
 	// nothing to compare against: verify the stream itself instead.
 	expectedDigest := ""
-	if h.proxy.Passthrough {
+	if h.proxy.StreamArtifacts {
 		expectedDigest = "sha256:" + digest
 	}
 	result, err := h.proxy.GetOrFetchArtifactFromURLWithDigest(

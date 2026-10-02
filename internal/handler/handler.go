@@ -172,12 +172,13 @@ type Proxy struct {
 	// URLs so clients receive a public address even when the proxy reaches
 	// storage at an internal one.
 	DirectServeBaseURL string
-	// Passthrough streams artifacts from upstream without storing them. Each
-	// request fetches its own copy: there is no cache to check and nothing
-	// for concurrent misses to share.
-	Passthrough bool
-	HTTPClient  *http.Client
-	AuthForURL  func(string) (headerName, headerValue string)
+	HTTPClient         *http.Client
+	AuthForURL         func(string) (headerName, headerValue string)
+
+	// StreamArtifacts streams artifacts from upstream without storing them.
+	// Each request fetches its own copy: there is no cache to check and
+	// nothing for concurrent misses to share.
+	StreamArtifacts bool
 
 	// Scanners runs pre-cache artifact scanning (e.g. trivy, ClamAV, Wiz).
 	// Nil or disabled means artifacts are cached without scanning.
@@ -246,7 +247,7 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 			return nil, errors.New("resolved artifact has no filename")
 		}
 	}
-	if p.Passthrough {
+	if p.StreamArtifacts {
 		if info == nil {
 			if info, err = p.resolveArtifact(ctx, ecosystem, name, version); err != nil {
 				return nil, err
@@ -304,13 +305,13 @@ func (p *Proxy) ClearCachedArtifact(ecosystem, name, version, filename string) e
 }
 
 // checkCache looks up an artifact in the cache. Returns nil if not cached.
-// In passthrough mode it always reports a miss, so entries stored before the
+// With StreamArtifacts set it always reports a miss, so entries stored before the
 // mode was enabled are never served.
 func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename string) (*CacheResult, error) {
 	if p.Denylist.Denied(versionPURL) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
-	if p.Passthrough {
+	if p.StreamArtifacts {
 		return nil, nil
 	}
 	artifact, err := p.DB.GetCachedArtifact(pkgPURL, versionPURL, filename)
@@ -1347,7 +1348,7 @@ func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, eco
 	if p.versionDenied(ecosystem, name, version) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, canonicalVersionPURL(ecosystem, name, version))
 	}
-	if p.Passthrough {
+	if p.StreamArtifacts {
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash,
 			func(fetchCtx context.Context) (*fetch.Artifact, error) {
 				return p.Fetcher.FetchWithHeaders(fetchCtx, downloadURL, headers)
@@ -1435,7 +1436,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, artifact)
 }
 
-// streamFromUpstream fetches an artifact for passthrough mode and hands its
+// streamFromUpstream fetches an artifact when StreamArtifacts is set and hands its
 // body to the caller without storing it.
 //
 // With upstreamHash set the body is verified as it streams. The size is left
