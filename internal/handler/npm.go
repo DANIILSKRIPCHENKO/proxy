@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,6 +17,17 @@ const (
 	npmUpstream      = "https://registry.npmjs.org"
 	npmAcceptDefault = "application/vnd.npm.install-v1+json;q=1.0, application/json;q=0.8"
 	scopedParts      = 2 // scope + name in scoped packages
+
+	// npmSecurityPrefix covers the audit endpoints: /-/npm/v1/security/audits,
+	// .../audits/quick and .../advisories/bulk.
+	npmSecurityPrefix = "/-/npm/v1/security/"
+
+	// npmKeysPath serves the registry signing keys `npm audit signatures` reads.
+	npmKeysPath = "/-/npm/v1/keys"
+
+	// npmSecurityMaxBody caps the audit payload. Buffering it lets an oversized
+	// body be refused before the upstream request starts.
+	npmSecurityMaxBody = 16 << 20
 )
 
 // NPMHandler handles npm registry protocol requests.
@@ -41,8 +54,22 @@ func NewNPMHandler(proxy *Proxy, proxyURL, upstreamURL string) *NPMHandler {
 // Mount this at /npm on your router.
 func (h *NPMHandler) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The /-/npm/v1 endpoints share the /-/ prefix with tarball paths, so
+		// they are routed before the tarball dispatch below. Audits are POSTs,
+		// so they also precede the GET-only gate.
+		if strings.HasPrefix(r.URL.Path, npmSecurityPrefix) {
+			h.handleSecurity(w, r)
+			return
+		}
+
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if r.URL.Path == npmKeysPath {
+			h.proxy.ProxyUpstream(w, r, h.upstreamURL+npmKeysPath,
+				[]string{headerAccept, headerAcceptEncoding})
 			return
 		}
 
@@ -57,6 +84,73 @@ func (h *NPMHandler) Routes() http.Handler {
 		// Otherwise it's a metadata request
 		h.handlePackageMetadata(w, r)
 	})
+}
+
+// handleSecurity relays the npm audit endpoints to upstream. The request body
+// is the dependency tree being audited, so no two requests share a cache key,
+// and the response carries no tarball URLs to rewrite.
+//
+// Advisories come from upstream's database, not the proxy's own vulnerability
+// data, and versions withheld by cooldown are not excluded from the report.
+func (h *NPMHandler) handleSecurity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if containsPathTraversal(r.URL.Path) {
+		JSONError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, npmSecurityMaxBody))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			JSONError(w, http.StatusRequestEntityTooLarge, "audit request too large")
+			return
+		}
+		// A client aborting mid-upload must not be told its payload was too big.
+		h.proxy.Logger.Warn("npm audit request body unreadable", "path", r.URL.Path, "error", err)
+		JSONError(w, http.StatusBadRequest, "could not read audit request")
+		return
+	}
+
+	// EscapedPath keeps an encoded "?" or "#" from turning the rest of the path
+	// into a query or fragment upstream.
+	upstreamURL := h.upstreamURL + r.URL.EscapedPath()
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	h.proxy.Logger.Info("npm audit request", "path", r.URL.Path, "bytes", len(body))
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		JSONError(w, http.StatusInternalServerError, "failed to create request")
+		return
+	}
+
+	// Clients may gzip the body, so the headers describing it travel with it.
+	for _, header := range []string{headerContentType, headerContentEncoding, headerAccept, headerAcceptEncoding} {
+		if v := r.Header.Get(header); v != "" {
+			req.Header.Set(header, v)
+		}
+	}
+	if req.Header.Get(headerContentType) == "" {
+		req.Header.Set(headerContentType, contentTypeJSON)
+	}
+	h.proxy.applyUpstreamAuth(req)
+
+	resp, err := h.proxy.HTTPClient.Do(req)
+	if err != nil {
+		h.proxy.Logger.Error("npm audit request failed", "path", r.URL.Path, "error", err)
+		JSONError(w, http.StatusBadGateway, "failed to reach upstream registry")
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	h.proxy.relayResponse(w, r, resp, nil)
 }
 
 // handlePackageMetadata proxies package metadata from upstream and rewrites tarball URLs.

@@ -42,6 +42,7 @@ func relayTestRoutes(proxy *Proxy, upstream string) http.Handler {
 	mount("/hex", NewHexHandlerWithUpstreams(proxy, proxyURL, upstream, upstream).Routes())
 	mount("/swift", NewSwiftHandler(proxy, proxyURL, upstream).Routes())
 	mount("/v2", NewContainerHandlerWithRegistry(proxy, proxyURL, upstream).Routes())
+	mount("/npm", NewNPMHandler(proxy, proxyURL, upstream).Routes())
 	// Match the production recovery middleware: it must not swallow the abort.
 	return middleware.Recoverer(mux)
 }
@@ -54,6 +55,7 @@ func TestRelayRoutes(t *testing.T) {
 		"/gem/info/demo", "/conda/conda-forge/noarch/repodata.json",
 		"/hex/packages/demo", "/swift/scope/demo/1.0.0/Package.swift",
 		"/v2/library/demo/manifests/latest", "/v2/library/demo/tags/list",
+		"/npm/-/npm/v1/keys",
 	} {
 		t.Run(route, func(t *testing.T) {
 			for _, truncated := range []bool{false, true} {
@@ -80,9 +82,11 @@ func testRelayRoute(t *testing.T, route string, truncated bool) {
 		if !truncated {
 			_, _ = fmt.Fprint(rw, "0\r\nX-Checksum: verified\r\nX-Late: discovered-at-eof\r\nX-Private: still-secret\r\n\r\n")
 		}
-		if err := rw.Flush(); err != nil {
-			t.Error(err)
-		}
+		// Two of these routes fan out a second upstream request for cooldown
+		// timestamps and abandon its body on a non-200, so this may be writing to
+		// a connection the proxy has already dropped. What the proxy made of the
+		// response under test is asserted downstream.
+		_ = rw.Flush()
 	}))
 	defer upstream.Close()
 	proxy := testProxy()
